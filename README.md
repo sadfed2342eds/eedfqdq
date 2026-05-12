@@ -68,16 +68,21 @@ PBKDF2 внутри `bip39.NewSeed`) и скорости диска для outpu
 
 ## Checker (GoChain native balance)
 
-Отдельный нативный чеккер (только stdlib, без внешних зависимостей).
-Двухфазная проверка:
+Нативный чеккер (только stdlib). Pipeline из 4 этапов:
 
-1. Батчевый JSON-RPC запрос `eth_getTransactionCount` + `eth_getCode`
-   (в одном HTTP round-trip). Адрес считается **активным**, если
-   `nonce > 0` ИЛИ есть код (контракт).
-2. Для активных адресов - батчевый `eth_getBalance`.
+```
+[input] -> activity-workers -> aggregator -> balance-workers -> writer
+```
 
-Неактивные адреса в вывод не попадают.
-Активные с нулевым балансом - попадают (ты просил именно так).
+1. **Activity** (фаза 1): батч `eth_getTransactionCount` + `eth_getCode`
+   (2*N вызовов в одном HTTP round-trip). Активный = `nonce > 0` ИЛИ контракт.
+2. **Aggregator**: собирает поток активных адресов из всех phase-1 воркеров
+   в крупные батчи (по `-bb`, default 500) с принудительным flush по
+   таймеру (`-flush` ms). Phase 2 всегда работает большими батчами.
+3. **Balance** (фаза 2): батч `eth_getBalance` для активных.
+4. **Writer**: один bufio.Writer 1 MiB в отдельной горутине.
+
+В `result.txt` попадают все активные адреса (включая с 0 балансом).
 
 ### Сборка
 
@@ -88,11 +93,11 @@ go build -ldflags="-s -w" -o checker.exe ./cmd/checker
 ### Запуск
 
 ```bash
-# по умолчанию: in=adress.txt, out=result.txt, публичные RPC gochain
+# дефолты: in=adress.txt, out=result.txt, публичные rpc.gochain.io/org
 checker.exe
 
-# свой RPC (например, приватная нода) + 128 воркеров
-checker.exe -rpc https://my-node:8545 -w 128 -batch 200
+# своя нода, агрессивные параметры
+checker.exe -rpc https://my-node:8545 -wa 128 -wb 64 -ab 500 -bb 1000
 ```
 
 ### Формат `result.txt`
@@ -110,22 +115,22 @@ checker.exe -rpc https://my-node:8545 -w 128 -batch 200
 
 ### Флаги
 
-| Флаг        | Default                                                  | Смысл                             |
-|-------------|----------------------------------------------------------|-----------------------------------|
-| `-in`       | `adress.txt`                                             | файл со списком адресов           |
-| `-out`      | `result.txt`                                             | вывод активных адресов            |
-| `-rpc`      | `https://rpc.gochain.io,https://rpc.gochain.org`         | RPC endpoints через запятую       |
-| `-w`        | `NumCPU()*4`                                             | число HTTP-воркеров               |
-| `-batch`    | `100`                                                    | адресов на один JSON-RPC batch    |
-| `-timeout`  | `30s`                                                    | HTTP timeout                      |
-| `-retries`  | `3`                                                      | ретраи на сетевую/HTTP ошибку     |
+| Флаг        | Default                                            | Смысл                                     |
+|-------------|----------------------------------------------------|-------------------------------------------|
+| `-in`       | `adress.txt`                                       | файл со списком адресов                   |
+| `-out`      | `result.txt`                                       | вывод активных адресов                    |
+| `-rpc`      | `https://rpc.gochain.io,https://rpc.gochain.org`   | RPC endpoints через запятую (round-robin) |
+| `-wa`       | `NumCPU()*4`                                       | activity-phase воркеры                    |
+| `-wb`       | `NumCPU()*2`                                       | balance-phase воркеры                     |
+| `-ab`       | `200`                                              | адресов в activity-батче                  |
+| `-bb`       | `500`                                              | адресов в balance-батче                   |
+| `-flush`    | `500`                                              | мс до flush неполного balance-батча       |
+| `-timeout`  | `30s`                                              | HTTP timeout                              |
+| `-retries`  | `3`                                                | ретраи на сетевую/HTTP ошибку             |
 
 ### Замечания
 
-- Публичные RPC (`rpc.gochain.io`) имеют рейт-лимит; для массовой проверки
-  желательно поднять свою ноду или использовать платный провайдер и
-  передать через `-rpc`.
-- Эндпоинты указываются списком через запятую - воркеры раскладываются
-  между ними round-robin.
-- Батч и воркеры подбирай под ноду: на своей ноде можно `-w 256 -batch 500`,
-  на публичной лучше начать с `-w 8 -batch 50`.
+- Публичные RPC имеют рейт-лимит. Для больших списков бери свою ноду.
+- Несколько URL через запятую - воркеры размазываются round-robin.
+- Тюнинг: на публичном RPC начни с `-wa 8 -wb 4 -ab 50 -bb 100`,
+  на своей ноде можно `-wa 256 -wb 128 -ab 500 -bb 1000`.

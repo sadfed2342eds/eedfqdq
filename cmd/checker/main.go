@@ -1,15 +1,14 @@
-// Native fast GoChain activity+balance checker.
+// Native fast GoChain activity+balance checker (pipelined, batched).
 //
-// Pipeline (two-phase, per batch):
-//   1. eth_getTransactionCount(addr, "latest")   -> activity (nonce > 0)
-//      eth_getCode(addr, "latest")               -> activity (contract)
-//      Both are packed into ONE JSON-RPC batch request (2*N items).
-//   2. For addresses marked active in phase 1:
-//      eth_getBalance(addr, "latest")            -> native balance
+// Pipeline:
+//   [input] -> activity-workers (phase 1: getTransactionCount+getCode batch)
+//           -> aggregator (re-batches active addresses into full batches)
+//           -> balance-workers (phase 2: getBalance batch)
+//           -> writer
 //
-// Input:  adress.txt  - one address per line (0x-prefixed, 20 bytes hex).
-// Output: result.txt  - "<address> <wei> <GO> nonce=<n> contract=<bool>"
-//                       (active addresses only, including zero balance).
+// Input:  adress.txt - one address per line (0x-prefixed, 20 bytes hex).
+// Output: result.txt - "<address> <wei> <GO> nonce=<n> contract=<bool>"
+//                      (active addresses only, including zero balance).
 //
 // No external deps (stdlib only).
 package main
@@ -66,9 +65,9 @@ func newPool(urls []string, timeout time.Duration) *rpcPool {
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		MaxIdleConns:        512,
-		MaxIdleConnsPerHost: 256,
-		MaxConnsPerHost:     256,
+		MaxIdleConns:        1024,
+		MaxIdleConnsPerHost: 512,
+		MaxConnsPerHost:     512,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 		ForceAttemptHTTP2:   true,
@@ -84,7 +83,6 @@ func (p *rpcPool) next() string {
 	return p.endpoints[int(i)%len(p.endpoints)]
 }
 
-// doBatch sends a pre-built batch and returns results by id -> hex string.
 func (p *rpcPool) doBatch(reqs []rpcReq, retries int) (map[int]string, error) {
 	body, err := json.Marshal(reqs)
 	if err != nil {
@@ -98,7 +96,6 @@ func (p *rpcPool) doBatch(reqs []rpcReq, retries int) (map[int]string, error) {
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-
 		resp, err := p.client.Do(req)
 		if err != nil {
 			lastErr = err
@@ -191,20 +188,25 @@ func isNonEmptyCode(hexStr string) bool {
 }
 
 // ------------------------------------------------------------------
-// Worker: two-phase check on a batch of addresses.
+// Records flowing between stages
 // ------------------------------------------------------------------
 
-type activeRec struct {
+type activeAddr struct {
 	address  string
 	nonce    uint64
 	contract bool
-	wei      *big.Int
 }
 
-func processBatch(pool *rpcPool, batch []string, retries int) ([]activeRec, int, error) {
-	// Phase 1: getTransactionCount + getCode, packed into one batch.
-	// IDs: 0..N-1 -> txCount for addresses[i]
-	//      N..2N-1 -> getCode for addresses[i-N]
+type balanced struct {
+	activeAddr
+	wei *big.Int
+}
+
+// ------------------------------------------------------------------
+// Phase 1: activity check (batched)
+// ------------------------------------------------------------------
+
+func activityBatch(pool *rpcPool, batch []string, retries int) ([]activeAddr, error) {
 	N := len(batch)
 	reqs := make([]rpcReq, 0, 2*N)
 	for i, a := range batch {
@@ -221,23 +223,16 @@ func processBatch(pool *rpcPool, batch []string, retries int) ([]activeRec, int,
 			Params: []interface{}{a, "latest"},
 		})
 	}
-	phase1, err := pool.doBatch(reqs, retries)
+	res, err := pool.doBatch(reqs, retries)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-
-	// Determine active addresses.
-	type prelim struct {
-		addr     string
-		nonce    uint64
-		contract bool
-	}
-	actives := make([]prelim, 0, N)
+	actives := make([]activeAddr, 0, N/8)
 	for i, a := range batch {
-		nonceHex, okN := phase1[i]
-		codeHex, okC := phase1[N+i]
+		nonceHex, okN := res[i]
+		codeHex, okC := res[N+i]
 		if !okN && !okC {
-			continue // RPC failure on both -> skip
+			continue
 		}
 		var nonce uint64
 		if okN {
@@ -247,43 +242,40 @@ func processBatch(pool *rpcPool, batch []string, retries int) ([]activeRec, int,
 		}
 		contract := okC && isNonEmptyCode(codeHex)
 		if nonce > 0 || contract {
-			actives = append(actives, prelim{addr: a, nonce: nonce, contract: contract})
+			actives = append(actives, activeAddr{address: a, nonce: nonce, contract: contract})
 		}
 	}
-	if len(actives) == 0 {
-		return nil, N, nil
-	}
+	return actives, nil
+}
 
-	// Phase 2: getBalance only for active addresses.
-	balReqs := make([]rpcReq, len(actives))
-	for i, p := range actives {
-		balReqs[i] = rpcReq{
+// ------------------------------------------------------------------
+// Phase 2: balance check (batched)
+// ------------------------------------------------------------------
+
+func balanceBatch(pool *rpcPool, batch []activeAddr, retries int) ([]balanced, error) {
+	reqs := make([]rpcReq, len(batch))
+	for i, p := range batch {
+		reqs[i] = rpcReq{
 			JSONRPC: "2.0", ID: i,
 			Method: "eth_getBalance",
-			Params: []interface{}{p.addr, "latest"},
+			Params: []interface{}{p.address, "latest"},
 		}
 	}
-	phase2, err := pool.doBatch(balReqs, retries)
+	res, err := pool.doBatch(reqs, retries)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-
-	out := make([]activeRec, 0, len(actives))
-	for i, p := range actives {
+	out := make([]balanced, len(batch))
+	for i, p := range batch {
 		wei := new(big.Int)
-		if bh, ok := phase2[i]; ok {
+		if bh, ok := res[i]; ok {
 			if v, ok2 := parseHexBig(bh); ok2 {
 				wei = v
 			}
 		}
-		out = append(out, activeRec{
-			address:  p.addr,
-			nonce:    p.nonce,
-			contract: p.contract,
-			wei:      wei,
-		})
+		out[i] = balanced{activeAddr: p, wei: wei}
 	}
-	return out, N, nil
+	return out, nil
 }
 
 // ------------------------------------------------------------------
@@ -296,8 +288,11 @@ func main() {
 	rpcList := flag.String("rpc",
 		"https://rpc.gochain.io,https://rpc.gochain.org",
 		"comma-separated RPC endpoints")
-	workers := flag.Int("w", runtime.NumCPU()*4, "number of HTTP worker goroutines")
-	batch := flag.Int("batch", 100, "addresses per JSON-RPC batch")
+	actWorkers := flag.Int("wa", runtime.NumCPU()*4, "activity-phase workers")
+	balWorkers := flag.Int("wb", runtime.NumCPU()*2, "balance-phase workers")
+	actBatch := flag.Int("ab", 200, "addresses per activity batch")
+	balBatch := flag.Int("bb", 500, "addresses per balance batch")
+	flushMs := flag.Int("flush", 500, "max ms to wait before flushing a partial balance batch")
 	timeout := flag.Duration("timeout", 30*time.Second, "HTTP timeout per request")
 	retries := flag.Int("retries", 3, "retries per batch on network/HTTP error")
 	flag.Parse()
@@ -313,7 +308,7 @@ func main() {
 	}
 	pool := newPool(endpoints, *timeout)
 
-	// load addresses
+	// ---- load addresses ----
 	fIn, err := os.Open(*inFile)
 	if err != nil {
 		log.Fatalf("open %s: %v", *inFile, err)
@@ -342,10 +337,10 @@ func main() {
 	if len(addresses) == 0 {
 		log.Fatal("no addresses loaded")
 	}
-	log.Printf("loaded %d addresses, %d workers, batch=%d, endpoints=%v",
-		len(addresses), *workers, *batch, endpoints)
+	log.Printf("loaded %d addresses; activity: w=%d batch=%d | balance: w=%d batch=%d | rpc=%v",
+		len(addresses), *actWorkers, *actBatch, *balWorkers, *balBatch, endpoints)
 
-	// output
+	// ---- output ----
 	fOut, err := os.Create(*outFile)
 	if err != nil {
 		log.Fatalf("create %s: %v", *outFile, err)
@@ -354,41 +349,105 @@ func main() {
 	bw := bufio.NewWriterSize(fOut, 1<<20)
 	var writeMu sync.Mutex
 
-	jobs := make(chan []string, *workers*2)
-	results := make(chan []activeRec, *workers*2)
+	// ---- pipeline channels ----
+	actJobs := make(chan []string, *actWorkers*2)        // raw address batches
+	activeStream := make(chan activeAddr, *actWorkers*256) // individual active addresses
+	balJobs := make(chan []activeAddr, *balWorkers*2)    // aggregated active batches
+	results := make(chan []balanced, *balWorkers*2)
 
-	var checked, failed, active, nonZero uint64
+	var checked, failActivity, failBalance, activeCnt, nonZero uint64
 
-	var wgW sync.WaitGroup
-	for i := 0; i < *workers; i++ {
-		wgW.Add(1)
+	// ---- phase 1 workers ----
+	var wg1 sync.WaitGroup
+	for i := 0; i < *actWorkers; i++ {
+		wg1.Add(1)
 		go func() {
-			defer wgW.Done()
-			for b := range jobs {
-				recs, done, err := processBatch(pool, b, *retries)
+			defer wg1.Done()
+			for b := range actJobs {
+				actives, err := activityBatch(pool, b, *retries)
 				if err != nil {
-					atomic.AddUint64(&failed, uint64(len(b)))
+					atomic.AddUint64(&failActivity, uint64(len(b)))
 					continue
 				}
-				atomic.AddUint64(&checked, uint64(done))
-				if len(recs) > 0 {
-					results <- recs
+				atomic.AddUint64(&checked, uint64(len(b)))
+				for _, a := range actives {
+					activeStream <- a
 				}
 			}
 		}()
 	}
 
-	var wgR sync.WaitGroup
-	wgR.Add(1)
+	// ---- aggregator: packs activeStream into balJobs of size balBatch ----
+	var wgAgg sync.WaitGroup
+	wgAgg.Add(1)
 	go func() {
-		defer wgR.Done()
+		defer wgAgg.Done()
+		buf := make([]activeAddr, 0, *balBatch)
+		timer := time.NewTimer(time.Duration(*flushMs) * time.Millisecond)
+		defer timer.Stop()
+		flush := func() {
+			if len(buf) == 0 {
+				return
+			}
+			out := make([]activeAddr, len(buf))
+			copy(out, buf)
+			balJobs <- out
+			buf = buf[:0]
+		}
+		for {
+			select {
+			case a, ok := <-activeStream:
+				if !ok {
+					flush()
+					return
+				}
+				buf = append(buf, a)
+				if len(buf) >= *balBatch {
+					flush()
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(time.Duration(*flushMs) * time.Millisecond)
+				}
+			case <-timer.C:
+				flush()
+				timer.Reset(time.Duration(*flushMs) * time.Millisecond)
+			}
+		}
+	}()
+
+	// ---- phase 2 workers ----
+	var wg2 sync.WaitGroup
+	for i := 0; i < *balWorkers; i++ {
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			for b := range balJobs {
+				recs, err := balanceBatch(pool, b, *retries)
+				if err != nil {
+					atomic.AddUint64(&failBalance, uint64(len(b)))
+					continue
+				}
+				results <- recs
+			}
+		}()
+	}
+
+	// ---- writer ----
+	var wgW sync.WaitGroup
+	wgW.Add(1)
+	go func() {
+		defer wgW.Done()
 		for recs := range results {
 			writeMu.Lock()
 			for _, r := range recs {
 				fmt.Fprintf(bw, "%s %s %s nonce=%d contract=%t\n",
 					r.address, r.wei.String(), weiToGO(r.wei),
 					r.nonce, r.contract)
-				atomic.AddUint64(&active, 1)
+				atomic.AddUint64(&activeCnt, 1)
 				if r.wei.Sign() > 0 {
 					atomic.AddUint64(&nonZero, 1)
 				}
@@ -397,6 +456,7 @@ func main() {
 		}
 	}()
 
+	// ---- progress ----
 	stop := make(chan struct{})
 	go func() {
 		t := time.NewTicker(5 * time.Second)
@@ -406,32 +466,39 @@ func main() {
 			select {
 			case <-t.C:
 				c := atomic.LoadUint64(&checked)
-				fl := atomic.LoadUint64(&failed)
-				ac := atomic.LoadUint64(&active)
+				f1 := atomic.LoadUint64(&failActivity)
+				f2 := atomic.LoadUint64(&failBalance)
+				ac := atomic.LoadUint64(&activeCnt)
 				nz := atomic.LoadUint64(&nonZero)
 				el := time.Since(start).Seconds()
 				fmt.Fprintf(os.Stderr,
-					"[+%6.0fs] checked=%d failed=%d active=%d non-zero=%d rate=%.0f addr/s\n",
-					el, c, fl, ac, nz, float64(c)/el)
+					"[+%6.0fs] checked=%d failA=%d failB=%d active=%d non-zero=%d rate=%.0f addr/s\n",
+					el, c, f1, f2, ac, nz, float64(c)/el)
 			case <-stop:
 				return
 			}
 		}
 	}()
 
+	// ---- feed ----
 	start := time.Now()
-	for i := 0; i < len(addresses); i += *batch {
-		end := i + *batch
+	for i := 0; i < len(addresses); i += *actBatch {
+		end := i + *actBatch
 		if end > len(addresses) {
 			end = len(addresses)
 		}
-		jobs <- addresses[i:end]
+		actJobs <- addresses[i:end]
 	}
-	close(jobs)
+	close(actJobs)
 
-	wgW.Wait()
+	// order: phase1 -> aggregator -> phase2 -> writer
+	wg1.Wait()
+	close(activeStream)
+	wgAgg.Wait()
+	close(balJobs)
+	wg2.Wait()
 	close(results)
-	wgR.Wait()
+	wgW.Wait()
 	close(stop)
 
 	if err := bw.Flush(); err != nil {
@@ -439,10 +506,11 @@ func main() {
 	}
 
 	fmt.Fprintf(os.Stderr,
-		"Done in %.2fs: total=%d checked=%d failed=%d active=%d non-zero=%d\n",
+		"Done in %.2fs: total=%d checked=%d failA=%d failB=%d active=%d non-zero=%d\n",
 		time.Since(start).Seconds(), len(addresses),
 		atomic.LoadUint64(&checked),
-		atomic.LoadUint64(&failed),
-		atomic.LoadUint64(&active),
+		atomic.LoadUint64(&failActivity),
+		atomic.LoadUint64(&failBalance),
+		atomic.LoadUint64(&activeCnt),
 		atomic.LoadUint64(&nonZero))
 }
