@@ -245,7 +245,22 @@ def resolve_target(explicit: Optional[str]) -> Optional[Path]:
     return None
 
 
+def _force_utf8_stdio() -> None:
+    """Windows consoles default to cp1251 / cp866 and choke on coin names like
+    'Monero', 'Zcash' with accented chars. Reconfigure std streams to UTF-8.
+    Silently ignored on older Python / non-reconfigurable streams."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def main() -> int:
+    _force_utf8_stdio()
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
